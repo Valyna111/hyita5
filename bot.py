@@ -182,7 +182,7 @@ class MangaBuffAuth:
         resp = self.get(f'{self.BASE_URL}/')
         if resp is None or resp.status_code != 200:
             return None
-        match = re.search(r'data-userid="(\d+)"', resp.text)
+        match = re.search(r'data-userid="\d+"', resp.text)
         if not match:
             match = re.search(r'/users/(\d+)', resp.text)
         return match.group(1) if match else None
@@ -463,54 +463,57 @@ def handle_captcha_resolved(call):
 # ---------- ОБРАБОТКА ОБМЕНА ----------
 def process_trade(trade_id, auth, chat_id):
     logger.info(f"▶️ Начинаем обработку обмена {trade_id}")
-    details = get_trade_details(auth, trade_id)
-    if not details:
-        logger.warning(f"❌ Не удалось получить детали обмена {trade_id}")
-        return False
-
-    offered_count = len(details['offered_cards'])
-    required_count = len(details['required_cards'])
-    logger.info(f"📊 Обмен {trade_id}: предлагают {offered_count}, просят {required_count}")
-
-    # Условие: отдаём 1, получаем 2+
-    accept = (required_count == 1 and offered_count >= 2)
-    result_msg = ""
-
-    if accept:
-        logger.info(f"✅ Условие выполнено, принимаем обмен {trade_id}")
-        success, msg = accept_trade(auth, trade_id, max_retries=3)
-        if success:
-            result_msg = "✅ **Обмен автоматически ПРИНЯТ!**"
-        else:
-            result_msg = f"❌ **Не удалось принять обмен**: {msg}"
-    else:
-        if required_count != 1:
-            reason = f"вы отдаёте {required_count} карт (нужно ровно 1)"
-        elif offered_count < 2:
-            reason = f"вам предлагают {offered_count} карт (нужно 2 и более)"
-        else:
-            reason = "неподходящие условия"
-        result_msg = f"⏩ **Обмен проигнорирован** (получаете:{offered_count} / отдаёте:{required_count}) – {reason}"
-        logger.info(f"⏩ Обмен {trade_id} проигнорирован: {reason}")
-
-    message = f"🔄 **Новое предложение обмена**\n\n"
-    message += f"👤 *Отправитель:* {html.escape(details['sender_name'])}\n"
-    message += f"🔗 [Ссылка на обмен]({details['url']})\n\n"
-    message += f"📦 *Предлагают:* {offered_count} карт\n"
-    for card in details['offered_cards']:
-        message += f"  • [Карта]({card['url']})\n"
-    message += f"\n📤 *Вы отдаёте:* {required_count} карт\n"
-    for card in details['required_cards']:
-        message += f"  • [Карта]({card['url']})\n"
-    message += f"\n{result_msg}"
-
     try:
-        bot.send_message(chat_id, message, parse_mode='Markdown', disable_web_page_preview=True)
-        logger.info(f"📨 Отправлено сообщение в чат {chat_id}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки сообщения: {e}")
+        details = get_trade_details(auth, trade_id)
+        if not details:
+            logger.warning(f"❌ Не удалось получить детали обмена {trade_id}")
+            return False
 
-    return success if accept else False
+        offered_count = len(details['offered_cards'])
+        required_count = len(details['required_cards'])
+        logger.info(f"📊 Обмен {trade_id}: предлагают {offered_count}, просят {required_count}")
+
+        accept = (required_count == 1 and offered_count >= 2)
+        result_msg = ""
+
+        if accept:
+            logger.info(f"✅ Условие выполнено, принимаем обмен {trade_id}")
+            success, msg = accept_trade(auth, trade_id, max_retries=3)
+            if success:
+                result_msg = "✅ **Обмен автоматически ПРИНЯТ!**"
+            else:
+                result_msg = f"❌ **Не удалось принять обмен**: {msg}"
+        else:
+            if required_count != 1:
+                reason = f"вы отдаёте {required_count} карт (нужно ровно 1)"
+            elif offered_count < 2:
+                reason = f"вам предлагают {offered_count} карт (нужно 2 и более)"
+            else:
+                reason = "неподходящие условия"
+            result_msg = f"⏩ **Обмен проигнорирован** (получаете:{offered_count} / отдаёте:{required_count}) – {reason}"
+            logger.info(f"⏩ Обмен {trade_id} проигнорирован: {reason}")
+
+        message = f"🔄 **Новое предложение обмена**\n\n"
+        message += f"👤 *Отправитель:* {html.escape(details['sender_name'])}\n"
+        message += f"🔗 [Ссылка на обмен]({details['url']})\n\n"
+        message += f"📦 *Предлагают:* {offered_count} карт\n"
+        for card in details['offered_cards']:
+            message += f"  • [Карта]({card['url']})\n"
+        message += f"\n📤 *Вы отдаёте:* {required_count} карт\n"
+        for card in details['required_cards']:
+            message += f"  • [Карта]({card['url']})\n"
+        message += f"\n{result_msg}"
+
+        try:
+            bot.send_message(chat_id, message, parse_mode='Markdown', disable_web_page_preview=True)
+            logger.info(f"📨 Отправлено сообщение в чат {chat_id}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения: {e}")
+
+        return success if accept else False
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка в process_trade: {e}", exc_info=True)
+        return False
 
 # ---------- РЕЗЕРВНЫЙ ОПРОС ----------
 def check_and_process_new_trades(auth, chat_id):
@@ -604,7 +607,7 @@ def on_ws_message(ws, message):
     global ws_connected, ws_running, ws_auth, ws_chat_id
     try:
         msg = str(message)
-        logger.info(f"WS: получено сообщение: {msg[:200]}")
+        logger.info(f"WS: получено сообщение: {msg[:200]}")  # Логируем первые 200 символов
 
         if msg == '2':
             ws.send('3')
@@ -639,14 +642,16 @@ def on_ws_message(ws, message):
                 payload = data[1] if len(data) > 1 else {}
                 trade_id = payload.get('tradeId')
                 if not trade_id:
-                    # Пытаемся извлечь tradeId из поля message (HTML)
-                    message_html = payload.get('message', '')
-                    if message_html:
-                        # Ищем href="/trades/123456"
-                        match = re.search(r'href=["\']/trades/(\d+)["\']', message_html)
-                        if match:
-                            trade_id = match.group(1)
-                            logger.info(f"📩 Извлекли tradeId из HTML: {trade_id}")
+                    # Ищем tradeId в HTML-сообщении
+                    html_msg = payload.get('message', '')
+                    match = re.search(r'/trades/(\d+)', html_msg)
+                    if match:
+                        trade_id = match.group(1)
+                        logger.info(f"📩 Извлекли tradeId из HTML: {trade_id}")
+                    else:
+                        logger.warning(f"❌ Не удалось извлечь tradeId из payload: {payload}")
+                        return
+                
                 if trade_id:
                     logger.info(f"📩 Получен tradeId: {trade_id}")
                     with processed_lock:
@@ -655,23 +660,27 @@ def on_ws_message(ws, message):
                             return
                         processed_trades.add(trade_id)
                         save_processed_trades()
-                    threading.Thread(
-                        target=process_trade,
-                        args=(trade_id, ws_auth, ws_chat_id),
-                        daemon=True
-                    ).start()
+                    
+                    # Проверяем, что ws_auth и ws_chat_id установлены
+                    if ws_auth is None or ws_chat_id is None:
+                        logger.error("❌ ws_auth или ws_chat_id не установлены! Обработка невозможна.")
+                        return
+                    
+                    # Вызываем обработку синхронно (для отладки)
+                    logger.info(f"🔄 Запускаем process_trade для {trade_id}")
+                    process_trade(trade_id, ws_auth, ws_chat_id)
                 else:
                     logger.warning(f"❌ Не удалось извлечь tradeId из payload: {payload}")
             except json.JSONDecodeError as e:
                 logger.error(f"❌ Ошибка парсинга JSON в WS: {e} | message: {msg[:200]}")
             except Exception as e:
-                logger.error(f"❌ Ошибка обработки события WS: {e}")
+                logger.error(f"❌ Ошибка обработки события WS: {e}", exc_info=True)
             return
 
         logger.debug(f"WS: получено другое сообщение: {msg[:100]}")
 
     except Exception as e:
-        logger.error(f"❌ Ошибка в on_ws_message: {e}")
+        logger.error(f"❌ Ошибка в on_ws_message: {e}", exc_info=True)
 
 def on_ws_error(ws, error):
     logger.error(f"❌ WebSocket ошибка: {error}")
