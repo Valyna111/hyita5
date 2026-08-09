@@ -367,15 +367,19 @@ def load_processed_trades():
     if PROCESSED_TRADES_FILE.exists():
         try:
             data = json.loads(PROCESSED_TRADES_FILE.read_text(encoding="utf-8"))
-            with processed_lock:
-                processed_trades = set(data.get("trades", []))
+            # with processed_lock:
+            processed_trades = set(data.get("trades", []))
         except:
             processed_trades = set()
+    else:
+        processed_trades = set()
+    logger.info(f"Загружено processed_trades: {processed_trades}")
 
 def save_processed_trades():
-    with processed_lock:
-        data = {"trades": list(processed_trades)}
+    # with processed_lock:
+    data = {"trades": list(processed_trades)}
     PROCESSED_TRADES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Сохранено processed_trades: {data}")
 
 def load_captcha_pause():
     global captcha_paused, captcha_notified
@@ -528,12 +532,12 @@ def check_and_process_new_trades(auth, chat_id):
 
     logger.info(f"📋 Найдено {len(trades)} обменов")
     new_trades = []
-    with processed_lock:
-        for t in trades:
-            if t['trade_id'] not in processed_trades:
-                new_trades.append(t)
-                processed_trades.add(t['trade_id'])
-        save_processed_trades()
+    # with processed_lock:
+    for t in trades:
+        if t['trade_id'] not in processed_trades:
+            new_trades.append(t)
+            processed_trades.add(t['trade_id'])
+    save_processed_trades()
 
     if not new_trades:
         logger.info("ℹ️ Новых обменов нет")
@@ -654,21 +658,31 @@ def on_ws_message(ws, message):
                 
                 if trade_id:
                     logger.info(f"📩 Получен tradeId: {trade_id}")
-                    with processed_lock:
-                        if trade_id in processed_trades:
-                            logger.debug(f"Обмен {trade_id} уже обработан")
-                            return
-                        processed_trades.add(trade_id)
-                        save_processed_trades()
+                    
+                    # --- УБРАЛИ БЛОКИРОВКУ ДЛЯ ОТЛАДКИ ---
+                    logger.info(f"🔍 Проверяем processed_trades для {trade_id}")
+                    logger.info(f"Текущий processed_trades: {processed_trades}")
+                    
+                    if trade_id in processed_trades:
+                        logger.info(f"ℹ️ Обмен {trade_id} уже обработан, игнорируем")
+                        return
+                    
+                    logger.info(f"➕ Добавляем {trade_id} в processed_trades")
+                    processed_trades.add(trade_id)
+                    logger.info(f"После добавления: {processed_trades}")
+                    save_processed_trades()
+                    logger.info(f"💾 Сохранили processed_trades")
                     
                     # Проверяем, что ws_auth и ws_chat_id установлены
+                    logger.info(f"🔍 Проверяем ws_auth и ws_chat_id...")
                     if ws_auth is None or ws_chat_id is None:
                         logger.error("❌ ws_auth или ws_chat_id не установлены! Обработка невозможна.")
                         return
                     
-                    # Вызываем обработку синхронно (для отладки)
+                    # Вызываем обработку синхронно
                     logger.info(f"🔄 Запускаем process_trade для {trade_id}")
                     process_trade(trade_id, ws_auth, ws_chat_id)
+                    logger.info(f"✅ process_trade завершён для {trade_id}")
                 else:
                     logger.warning(f"❌ Не удалось извлечь tradeId из payload: {payload}")
             except json.JSONDecodeError as e:
