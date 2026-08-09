@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram бот для автоматического принятия выгодных обменов на mangabuff.ru
-Принимает предложения, где:
-Вы отдаёте 1 карту, а получаете 2 и более (2:1, 3:1, 4:1, ...)
-(Обмены 1:1 игнорируются)
+Принимает: вы отдаёте 1 карту, получаете 2 и более (2:1, 3:1, ...)
 """
 
 import os
@@ -45,7 +43,6 @@ except ImportError:
     print("❌ Установите python-dotenv: pip install python-dotenv")
     sys.exit(1)
 
-# WebSocket для мгновенных уведомлений
 try:
     import websocket
 except ImportError:
@@ -59,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КЛАСС АВТОРИЗАЦИИ (доработан) ====================
+# ==================== КЛАСС АВТОРИЗАЦИИ ====================
 class MangaBuffAuth:
     BASE_URL = "https://mangabuff.ru"
 
@@ -96,15 +93,12 @@ class MangaBuffAuth:
         return ''
 
     def _request(self, method, url, **kwargs):
-        """Обёртка запроса с детектом капчи."""
         global captcha_paused, captcha_notified
-
         if captcha_paused:
             logger.warning("⏸️ Бот на паузе из-за капчи, запрос пропущен")
             return None
 
         response = self.session.request(method, url, **kwargs)
-
         final_url = response.url if hasattr(response, 'url') else None
         if final_url and "page-captcha" in final_url:
             logger.warning("⚠️ Обнаружена капча! Ставим бота на паузу.")
@@ -113,7 +107,6 @@ class MangaBuffAuth:
             save_captcha_pause()
             notify_captcha_operator()
             return None
-
         return response
 
     def get(self, url, **kwargs):
@@ -197,7 +190,7 @@ class MangaBuffAuth:
     def get_cookies_dict(self):
         return {name: value for name, value in self.session.cookies.items()}
 
-# ==================== ФУНКЦИИ ПАРСИНГА ОБМЕНОВ ====================
+# ==================== ФУНКЦИИ ПАРСИНГА ====================
 def get_trades(auth: MangaBuffAuth):
     url = f"{auth.BASE_URL}/trades"
     response = auth.get(url)
@@ -325,7 +318,7 @@ def accept_trade(auth: MangaBuffAuth, trade_id: str, max_retries: int = 3):
 
     return False, "Не удалось принять обмен"
 
-# ==================== НАСТРОЙКИ БОТА ====================
+# ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.getenv("TRADE_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     print("❌ Не найден TRADE_BOT_TOKEN или BOT_TOKEN в .env файле")
@@ -406,7 +399,6 @@ load_captcha_pause()
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ---------- функции для работы с сессией ----------
 def get_auth_for_user(chat_id: int) -> MangaBuffAuth:
     auth = MangaBuffAuth()
     if str(chat_id) in sessions:
@@ -468,21 +460,24 @@ def handle_captcha_resolved(call):
     bot.answer_callback_query(call.id, "✅ Пауза снята! Бот продолжает работу.")
     bot.send_message(chat_id, "✅ Капча пройдена. Мониторинг возобновлён.")
 
-# ---------- обработка обмена (исправленное условие) ----------
+# ---------- ОБРАБОТКА ОБМЕНА ----------
 def process_trade(trade_id, auth, chat_id):
+    logger.info(f"▶️ Начинаем обработку обмена {trade_id}")
     details = get_trade_details(auth, trade_id)
     if not details:
-        logger.warning(f"Не удалось получить детали обмена {trade_id}")
+        logger.warning(f"❌ Не удалось получить детали обмена {trade_id}")
         return False
 
     offered_count = len(details['offered_cards'])
     required_count = len(details['required_cards'])
+    logger.info(f"📊 Обмен {trade_id}: предлагают {offered_count}, просят {required_count}")
 
-    # НОВОЕ УСЛОВИЕ: отдаём ровно 1 карту, получаем 2 и более (НЕ 1:1)
+    # Условие: отдаём 1, получаем 2+
     accept = (required_count == 1 and offered_count >= 2)
     result_msg = ""
 
     if accept:
+        logger.info(f"✅ Условие выполнено, принимаем обмен {trade_id}")
         success, msg = accept_trade(auth, trade_id, max_retries=3)
         if success:
             result_msg = "✅ **Обмен автоматически ПРИНЯТ!**"
@@ -496,6 +491,7 @@ def process_trade(trade_id, auth, chat_id):
         else:
             reason = "неподходящие условия"
         result_msg = f"⏩ **Обмен проигнорирован** (получаете:{offered_count} / отдаёте:{required_count}) – {reason}"
+        logger.info(f"⏩ Обмен {trade_id} проигнорирован: {reason}")
 
     message = f"🔄 **Новое предложение обмена**\n\n"
     message += f"👤 *Отправитель:* {html.escape(details['sender_name'])}\n"
@@ -510,20 +506,24 @@ def process_trade(trade_id, auth, chat_id):
 
     try:
         bot.send_message(chat_id, message, parse_mode='Markdown', disable_web_page_preview=True)
+        logger.info(f"📨 Отправлено сообщение в чат {chat_id}")
     except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
+        logger.error(f"❌ Ошибка отправки сообщения: {e}")
 
     return success if accept else False
 
-# ---------- резервный опрос ----------
+# ---------- РЕЗЕРВНЫЙ ОПРОС ----------
 def check_and_process_new_trades(auth, chat_id):
     global current_check_interval, last_trade_time
 
+    logger.info("🔍 Резервный опрос /trades...")
     trades = get_trades(auth)
     if not trades:
+        logger.info("ℹ️ Нет обменов в списке")
         current_check_interval = min(current_check_interval * 1.5, MAX_CHECK_INTERVAL)
         return 0
 
+    logger.info(f"📋 Найдено {len(trades)} обменов")
     new_trades = []
     with processed_lock:
         for t in trades:
@@ -533,8 +533,10 @@ def check_and_process_new_trades(auth, chat_id):
         save_processed_trades()
 
     if not new_trades:
+        logger.info("ℹ️ Новых обменов нет")
         return 0
 
+    logger.info(f"⚡ Найдено {len(new_trades)} новых обменов, обрабатываю...")
     current_check_interval = CHECK_INTERVAL
     last_trade_time = time.time()
 
@@ -544,7 +546,7 @@ def check_and_process_new_trades(auth, chat_id):
 
     return len(new_trades)
 
-# ---------- WebSocket ----------
+# ---------- WEBSOCKET ----------
 def start_websocket(chat_id, auth):
     global ws_running, ws_thread
     if ws_running:
@@ -573,6 +575,7 @@ def websocket_thread(chat_id, auth):
         "Origin": "https://mangabuff.ru",
         "User-Agent": auth.session.headers.get("User-Agent", "Mozilla/5.0")
     }
+    logger.info(f"🔗 Заголовки WebSocket: {headers}")
 
     while ws_running:
         try:
@@ -601,6 +604,8 @@ def on_ws_message(ws, message):
     global ws_connected, ws_running, ws_auth, ws_chat_id
     try:
         msg = str(message)
+        logger.info(f"WS: получено сообщение: {msg[:200]}")
+
         if msg == '2':
             ws.send('3')
             return
@@ -634,7 +639,14 @@ def on_ws_message(ws, message):
                 payload = data[1] if len(data) > 1 else {}
                 trade_id = payload.get('tradeId')
                 if not trade_id:
-                    trade_id = payload.get('id')
+                    # Пытаемся извлечь tradeId из поля message (HTML)
+                    message_html = payload.get('message', '')
+                    if message_html:
+                        # Ищем href="/trades/123456"
+                        match = re.search(r'href=["\']/trades/(\d+)["\']', message_html)
+                        if match:
+                            trade_id = match.group(1)
+                            logger.info(f"📩 Извлекли tradeId из HTML: {trade_id}")
                 if trade_id:
                     logger.info(f"📩 Получен tradeId: {trade_id}")
                     with processed_lock:
@@ -669,7 +681,7 @@ def on_ws_close(ws, close_status_code, close_msg):
     ws_connected = False
     logger.warning(f"⚠️ WebSocket закрыт: {close_status_code} - {close_msg}")
 
-# ---------- мониторинг ----------
+# ---------- МОНИТОРИНГ ----------
 def monitoring_loop(chat_id):
     global monitoring_active, current_check_interval, last_trade_time, ws_auth, ws_chat_id
 
