@@ -2,6 +2,7 @@
 """
 Telegram бот для автоматического принятия выгодных обменов на mangabuff.ru
 Принимает: вы отдаёте 1 карту, получаете 2 и более (2:1, 3:1, ...)
+Работает ТОЛЬКО через WebSocket (HTTP-опрос отключён для снижения риска капчи)
 """
 
 import os
@@ -190,39 +191,7 @@ class MangaBuffAuth:
     def get_cookies_dict(self):
         return {name: value for name, value in self.session.cookies.items()}
 
-# ==================== ФУНКЦИИ ПАРСИНГА ====================
-def get_trades(auth: MangaBuffAuth):
-    url = f"{auth.BASE_URL}/trades"
-    response = auth.get(url)
-    if response is None or response.status_code != 200:
-        return []
-    soup = BeautifulSoup(response.text, 'html.parser')
-    trades = []
-    trade_items = soup.find_all('a', class_=lambda c: c and 'trade__list-item' in c.split())
-    for item in trade_items:
-        href = item.get('href')
-        if not href or '/trades/' not in href:
-            continue
-        trade_id = href.split('/')[-1]
-        trade_url = f"{auth.BASE_URL}{href}"
-        info_div = item.find('div', class_='trade__list-info')
-        if not info_div:
-            continue
-        date_elem = info_div.find('div', class_='trade__list-date')
-        date = date_elem.text.strip() if date_elem else ""
-        name_elem = info_div.find('div', class_='trade__list-name')
-        sender_name = name_elem.text.replace('от ', '').strip() if name_elem else ""
-        header_div = info_div.find('div', class_='trade__list-header')
-        is_new = bool(header_div and header_div.find('span', class_='trade__list-dot--new'))
-        trades.append({
-            'trade_id': trade_id,
-            'sender_name': sender_name,
-            'date': date,
-            'is_new': is_new,
-            'url': trade_url
-        })
-    return trades
-
+# ==================== ФУНКЦИИ ПАРСИНГА (используются только при принятии) ====================
 def get_trade_details(auth: MangaBuffAuth, trade_id: str):
     url = f"{auth.BASE_URL}/trades/{trade_id}"
     response = auth.get(url)
@@ -324,9 +293,6 @@ if not BOT_TOKEN:
     print("❌ Не найден TRADE_BOT_TOKEN или BOT_TOKEN в .env файле")
     sys.exit(1)
 
-CHECK_INTERVAL = 30
-MAX_CHECK_INTERVAL = 120
-
 SESSIONS_FILE = Path(__file__).parent / "tg_sessions.json"
 PROCESSED_TRADES_FILE = Path(__file__).parent / "processed_trades.json"
 CAPTCHA_PAUSE_FILE = Path(__file__).parent / "captcha_pause.json"
@@ -348,9 +314,6 @@ ws_chat_id = None
 captcha_paused = False
 captcha_notified = False
 
-current_check_interval = CHECK_INTERVAL
-last_trade_time = None
-
 def load_sessions():
     global sessions
     if SESSIONS_FILE.exists():
@@ -367,7 +330,6 @@ def load_processed_trades():
     if PROCESSED_TRADES_FILE.exists():
         try:
             data = json.loads(PROCESSED_TRADES_FILE.read_text(encoding="utf-8"))
-            # with processed_lock:
             processed_trades = set(data.get("trades", []))
         except:
             processed_trades = set()
@@ -376,7 +338,6 @@ def load_processed_trades():
     logger.info(f"Загружено processed_trades: {processed_trades}")
 
 def save_processed_trades():
-    # with processed_lock:
     data = {"trades": list(processed_trades)}
     PROCESSED_TRADES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info(f"Сохранено processed_trades: {data}")
@@ -445,24 +406,38 @@ def notify_captcha_operator():
 
 @bot.callback_query_handler(func=lambda call: call.data == "captcha_resolved")
 def handle_captcha_resolved(call):
-    global captcha_paused, captcha_notified
+    global captcha_paused, captcha_notified, ws_auth, ws_chat_id
     chat_id = call.message.chat.id
 
+    # 1. Пересоздаём авторизацию (подхватываем свежие куки)
     auth = get_auth_for_user(chat_id)
     if not auth:
         bot.answer_callback_query(call.id, "❌ Нет сессии. Войдите заново.")
         return
 
+    # 2. Проверяем, что капча действительно ушла
     resp = auth.get(f"{auth.BASE_URL}/")
     if resp is None or "page-captcha" in str(resp.url):
         bot.answer_callback_query(call.id, "❌ Капча всё ещё активна. Пройдите её вручную и нажмите снова.")
         return
 
+    # 3. Обновляем глобальные переменные для WS
+    ws_auth = auth
+    ws_chat_id = chat_id
+
+    # 4. Перезапускаем WebSocket с новой сессией
+    if ws_running:
+        logger.info("🔄 Перезапускаем WebSocket с обновлённой сессией")
+        stop_websocket()
+        time.sleep(2)  # даём время на закрытие
+        start_websocket(chat_id, auth)
+
+    # 5. Снимаем паузу
     captcha_paused = False
     captcha_notified = False
     save_captcha_pause()
     bot.answer_callback_query(call.id, "✅ Пауза снята! Бот продолжает работу.")
-    bot.send_message(chat_id, "✅ Капча пройдена. Мониторинг возобновлён.")
+    bot.send_message(chat_id, "✅ Капча пройдена. WebSocket переподключен с новой сессией.")
 
 # ---------- ОБРАБОТКА ОБМЕНА ----------
 def process_trade(trade_id, auth, chat_id):
@@ -518,40 +493,6 @@ def process_trade(trade_id, auth, chat_id):
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в process_trade: {e}", exc_info=True)
         return False
-
-# ---------- РЕЗЕРВНЫЙ ОПРОС ----------
-def check_and_process_new_trades(auth, chat_id):
-    global current_check_interval, last_trade_time
-
-    logger.info("🔍 Резервный опрос /trades...")
-    trades = get_trades(auth)
-    if not trades:
-        logger.info("ℹ️ Нет обменов в списке")
-        current_check_interval = min(current_check_interval * 1.5, MAX_CHECK_INTERVAL)
-        return 0
-
-    logger.info(f"📋 Найдено {len(trades)} обменов")
-    new_trades = []
-    # with processed_lock:
-    for t in trades:
-        if t['trade_id'] not in processed_trades:
-            new_trades.append(t)
-            processed_trades.add(t['trade_id'])
-    save_processed_trades()
-
-    if not new_trades:
-        logger.info("ℹ️ Новых обменов нет")
-        return 0
-
-    logger.info(f"⚡ Найдено {len(new_trades)} новых обменов, обрабатываю...")
-    current_check_interval = CHECK_INTERVAL
-    last_trade_time = time.time()
-
-    for trade in new_trades:
-        process_trade(trade['trade_id'], auth, chat_id)
-        time.sleep(0.5)
-
-    return len(new_trades)
 
 # ---------- WEBSOCKET ----------
 def start_websocket(chat_id, auth):
@@ -611,7 +552,7 @@ def on_ws_message(ws, message):
     global ws_connected, ws_running, ws_auth, ws_chat_id
     try:
         msg = str(message)
-        logger.info(f"WS: получено сообщение: {msg[:200]}")  # Логируем первые 200 символов
+        logger.info(f"WS: получено сообщение: {msg[:200]}")
 
         if msg == '2':
             ws.send('3')
@@ -646,7 +587,6 @@ def on_ws_message(ws, message):
                 payload = data[1] if len(data) > 1 else {}
                 trade_id = payload.get('tradeId')
                 if not trade_id:
-                    # Ищем tradeId в HTML-сообщении
                     html_msg = payload.get('message', '')
                     match = re.search(r'/trades/(\d+)', html_msg)
                     if match:
@@ -659,27 +599,19 @@ def on_ws_message(ws, message):
                 if trade_id:
                     logger.info(f"📩 Получен tradeId: {trade_id}")
                     
-                    # --- УБРАЛИ БЛОКИРОВКУ ДЛЯ ОТЛАДКИ ---
                     logger.info(f"🔍 Проверяем processed_trades для {trade_id}")
-                    logger.info(f"Текущий processed_trades: {processed_trades}")
-                    
                     if trade_id in processed_trades:
                         logger.info(f"ℹ️ Обмен {trade_id} уже обработан, игнорируем")
                         return
                     
                     logger.info(f"➕ Добавляем {trade_id} в processed_trades")
                     processed_trades.add(trade_id)
-                    logger.info(f"После добавления: {processed_trades}")
                     save_processed_trades()
-                    logger.info(f"💾 Сохранили processed_trades")
                     
-                    # Проверяем, что ws_auth и ws_chat_id установлены
-                    logger.info(f"🔍 Проверяем ws_auth и ws_chat_id...")
                     if ws_auth is None or ws_chat_id is None:
                         logger.error("❌ ws_auth или ws_chat_id не установлены! Обработка невозможна.")
                         return
                     
-                    # Вызываем обработку синхронно
                     logger.info(f"🔄 Запускаем process_trade для {trade_id}")
                     process_trade(trade_id, ws_auth, ws_chat_id)
                     logger.info(f"✅ process_trade завершён для {trade_id}")
@@ -704,9 +636,9 @@ def on_ws_close(ws, close_status_code, close_msg):
     ws_connected = False
     logger.warning(f"⚠️ WebSocket закрыт: {close_status_code} - {close_msg}")
 
-# ---------- МОНИТОРИНГ ----------
+# ---------- МОНИТОРИНГ (ТОЛЬКО WS) ----------
 def monitoring_loop(chat_id):
-    global monitoring_active, current_check_interval, last_trade_time, ws_auth, ws_chat_id
+    global monitoring_active, ws_auth, ws_chat_id
 
     logger.info(f"[MONITOR] Запуск для чата {chat_id}")
     auth = get_auth_for_user(chat_id)
@@ -719,30 +651,16 @@ def monitoring_loop(chat_id):
     ws_chat_id = chat_id
     start_websocket(chat_id, auth)
 
-    bot.send_message(chat_id, f"🔁 Мониторинг обменов запущен. WebSocket активен, резервный опрос каждые {CHECK_INTERVAL} сек.\nПринимаются обмены, где вы отдаёте ровно 1 карту и получаете 2 или более карт (2:1, 3:1, 4:1, ...).")
+    bot.send_message(chat_id, "🔁 Мониторинг обменов запущен (WebSocket).\nПринимаются обмены, где вы отдаёте ровно 1 карту и получаете 2 или более (2:1, 3:1, ...).")
 
     while monitoring_active:
+        # Если капча – просто ждём, ничего не опрашиваем
         if captcha_paused:
             time.sleep(30)
             continue
 
-        if last_trade_time and (time.time() - last_trade_time) > 300:
-            current_check_interval = min(current_check_interval * 1.2, MAX_CHECK_INTERVAL)
-        else:
-            current_check_interval = CHECK_INTERVAL
-
-        try:
-            new_count = check_and_process_new_trades(auth, chat_id)
-            if new_count > 0:
-                last_trade_time = time.time()
-                current_check_interval = CHECK_INTERVAL
-        except Exception as e:
-            logger.error(f"[MONITOR] Ошибка опроса: {e}")
-
-        for _ in range(int(current_check_interval)):
-            if not monitoring_active:
-                break
-            time.sleep(1)
+        # Никаких HTTP-опросов! Только WS.
+        time.sleep(1)  # небольшая пауза, чтобы не нагружать процессор
 
     stop_websocket()
     bot.send_message(chat_id, "🔕 Мониторинг обменов остановлен.")
@@ -765,7 +683,7 @@ def cmd_start(message):
         "/login email password – войти в аккаунт\n"
         "/logout – выйти\n"
         "/status – проверить авторизацию\n"
-        "/monitor_start – запустить мониторинг обменов (автопринятие, если вы отдаёте 1 карту, а получаете 2+)\n"
+        "/monitor_start – запустить мониторинг обменов (только WebSocket, без HTTP-опроса)\n"
         "/monitor_stop – остановить мониторинг\n\n"
         "Используйте кнопки для управления.",
         reply_markup=get_keyboard()
