@@ -683,7 +683,7 @@ def cmd_start(message):
         "/login email password – войти в аккаунт\n"
         "/logout – выйти\n"
         "/status – проверить авторизацию\n"
-        "/monitor_start – запустить мониторинг обменов (только WebSocket, без HTTP-опроса)\n"
+        "/monitor_start – запустить мониторинг обменов (автопринятие, если вы отдаёте 1 карту, а получаете 2+)\n"
         "/monitor_stop – остановить мониторинг\n\n"
         "Используйте кнопки для управления.",
         reply_markup=get_keyboard()
@@ -707,6 +707,13 @@ def cmd_login(message):
         user_id = result['user_id']
         save_user_session(chat_id, user_id, result['cookies'])
         bot.send_message(chat_id, f"✅ Успешный вход!\nВаш user_id: {user_id}\nСессия сохранена.")
+
+        # ===== ВТОРОЙ ВАРИАНТ: проверка сессии после логина =====
+        auth_test = get_auth_for_user(chat_id)
+        if auth_test.is_authenticated():
+            bot.send_message(chat_id, "✅ Сессия подтверждена. Можно запускать мониторинг.")
+        else:
+            bot.send_message(chat_id, "⚠️ Сессия НЕ ПОДТВЕРЖДЕНА! Возможно, сайт показал капчу или куки невалидны. Попробуйте войти снова.")
     else:
         bot.send_message(chat_id, f"❌ Ошибка входа: {result}")
 
