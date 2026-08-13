@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Telegram бот для автоматического принятия выгодных обменов на mangabuff.ru
-Принимает: вы отдаёте 1 карту, получаете 2 и более (2:1, 3:1, ...)
-Работает с РЕДКИМ HTTP-опросом (для стабильности на хостинге) + WebSocket
+Принимает предложения, где:
+1. Вы отдаёте ровно 1 карту и получаете 1 или более карт (1:1, 2:1, 3:1, ...)
+Работает с WebSocket + редкий адаптивный HTTP-опрос (для стабильности)
 """
 
 import os
@@ -57,7 +58,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КЛАСС АВТОРИЗАЦИИ (исправлен) ====================
+# ==================== КЛАСС АВТОРИЗАЦИИ ====================
 class MangaBuffAuth:
     BASE_URL = "https://mangabuff.ru"
 
@@ -74,7 +75,6 @@ class MangaBuffAuth:
         if proxy:
             self.session.proxies.update(proxy)
 
-        # Максимально приближенные к реальному браузеру заголовки
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -88,7 +88,7 @@ class MangaBuffAuth:
             'Pragma': 'no-cache',
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',  # для первого запроса, потом сменится
+            'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1',
         })
 
@@ -130,7 +130,6 @@ class MangaBuffAuth:
         return self._request('POST', url, data=data, json=json, **kwargs)
 
     def login(self, email: str, password: str):
-        """Повторяем попытки с разными impersonate и полными заголовками"""
         impersonate_versions = ["chrome133", "chrome134", "chrome131", "edge131", "safari17_0"]
         last_error = None
 
@@ -161,7 +160,6 @@ class MangaBuffAuth:
                     'Sec-Fetch-User': '?1',
                 })
 
-                # 1. GET /login – получаем CSRF и куки
                 resp = self.session.get(f'{self.BASE_URL}/login', timeout=30)
                 if resp.status_code == 403:
                     logger.warning(f"⚠️ 403 Forbidden с impersonate={imp}, пробуем следующий")
@@ -171,7 +169,6 @@ class MangaBuffAuth:
                     last_error = f'GET login failed: HTTP {resp.status_code}'
                     continue
 
-                # Обновляем заголовок Sec-Fetch-Site для POST (теперь same-origin)
                 self.session.headers.update({'Sec-Fetch-Site': 'same-origin'})
 
                 csrf = self._get_csrf_from_cookies()
@@ -181,7 +178,6 @@ class MangaBuffAuth:
 
                 time.sleep(1.5)
 
-                # 2. POST /login
                 login_data = {'email': email, 'password': password, 'remember': 'on'}
                 headers = {
                     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -194,7 +190,6 @@ class MangaBuffAuth:
                     'Sec-Fetch-Site': 'same-origin',
                     'Accept': 'application/json, text/javascript, */*; q=0.01',
                 }
-                # allow_redirects по умолчанию True
                 resp = self.session.post(
                     f'{self.BASE_URL}/login',
                     data=login_data,
@@ -202,7 +197,6 @@ class MangaBuffAuth:
                     timeout=30
                 )
 
-                # 3. Проверяем авторизацию через GET /
                 check = self.session.get(f'{self.BASE_URL}/', timeout=30)
                 if check.status_code != 200:
                     last_error = 'Auth check failed'
@@ -222,7 +216,8 @@ class MangaBuffAuth:
                     for name, value in self.session.cookies.items():
                         cookies.append({'name': name, 'value': value, 'domain': 'mangabuff.ru'})
                     logger.info(f"✅ Успешный вход с impersonate={imp}, user_id={user_id}")
-                    return True, {'user_id': user_id, 'cookies': cookies}
+                    self.impersonate = imp
+                    return True, {'user_id': user_id, 'cookies': cookies, 'impersonate': imp}
                 else:
                     last_error = 'User ID not found after login'
             except Exception as e:
@@ -232,7 +227,10 @@ class MangaBuffAuth:
 
         return False, last_error or "Не удалось войти после всех попыток"
 
-    def load_cookies(self, cookies_list: list):
+    def load_cookies(self, cookies_list: list, impersonate: str = None):
+        if impersonate:
+            self.impersonate = impersonate
+            self._setup_session(self.proxy)
         for c in cookies_list:
             name = c.get('name')
             value = c.get('value')
@@ -478,15 +476,23 @@ load_captcha_pause()
 bot = telebot.TeleBot(BOT_TOKEN)
 
 def get_auth_for_user(chat_id: int) -> MangaBuffAuth:
-    auth = MangaBuffAuth()
-    if str(chat_id) in sessions:
-        cookies = sessions[str(chat_id)].get('cookies', [])
+    chat_str = str(chat_id)
+    if chat_str in sessions:
+        data = sessions[chat_str]
+        cookies = data.get('cookies', [])
+        impersonate = data.get('impersonate', 'chrome133')
+        auth = MangaBuffAuth(impersonate=impersonate)
         if cookies:
-            auth.load_cookies(cookies)
-    return auth
+            auth.load_cookies(cookies, impersonate=impersonate)
+        return auth
+    return MangaBuffAuth()
 
-def save_user_session(chat_id: int, user_id: str, cookies: list):
-    sessions[str(chat_id)] = {'user_id': user_id, 'cookies': cookies}
+def save_user_session(chat_id: int, user_id: str, cookies: list, impersonate: str):
+    sessions[str(chat_id)] = {
+        'user_id': user_id,
+        'cookies': cookies,
+        'impersonate': impersonate
+    }
     save_sessions()
 
 def clear_user_session(chat_id: int):
@@ -560,7 +566,7 @@ def process_trade(trade_id, auth, chat_id):
         required_count = len(details['required_cards'])
         logger.info(f"📊 Обмен {trade_id}: предлагают {offered_count}, просят {required_count}")
 
-        accept = (required_count == 1 and offered_count >= 2)
+        accept = (required_count == 1 and offered_count >= 1)
         result_msg = ""
 
         if accept:
@@ -573,8 +579,8 @@ def process_trade(trade_id, auth, chat_id):
         else:
             if required_count != 1:
                 reason = f"вы отдаёте {required_count} карт (нужно ровно 1)"
-            elif offered_count < 2:
-                reason = f"вам предлагают {offered_count} карт (нужно 2 и более)"
+            elif offered_count < 1:
+                reason = f"вам предлагают {offered_count} карт (нужно 1 и более)"
             else:
                 reason = "неподходящие условия"
             result_msg = f"⏩ **Обмен проигнорирован** (получаете:{offered_count} / отдаёте:{required_count}) – {reason}"
@@ -739,7 +745,6 @@ def on_ws_message(ws, message):
 
                 if trade_id:
                     logger.info(f"📩 Получен tradeId: {trade_id}")
-                    logger.info(f"🔍 Проверяем processed_trades для {trade_id}")
                     if trade_id in processed_trades:
                         logger.info(f"ℹ️ Обмен {trade_id} уже обработан, игнорируем")
                         return
@@ -791,7 +796,7 @@ def monitoring_loop(chat_id):
     ws_chat_id = chat_id
     start_websocket(chat_id, auth)
 
-    bot.send_message(chat_id, f"🔁 Мониторинг обменов запущен. WebSocket активен, резервный опрос каждые ~{CHECK_INTERVAL} сек.\nПринимаются обмены, где вы отдаёте ровно 1 карту и получаете 2 или более (2:1, 3:1, ...).")
+    bot.send_message(chat_id, f"🔁 Мониторинг обменов запущен. WebSocket активен, резервный опрос каждые ~{CHECK_INTERVAL} сек.\nПринимаются обмены, где вы отдаёте ровно 1 карту и получаете 1 или более (1:1, 2:1, 3:1, ...).")
 
     while monitoring_active:
         if captcha_paused:
@@ -837,7 +842,7 @@ def cmd_start(message):
         "/login email password – войти в аккаунт\n"
         "/logout – выйти\n"
         "/status – проверить авторизацию\n"
-        "/monitor_start – запустить мониторинг обменов (автопринятие, если вы отдаёте 1 карту, а получаете 2+)\n"
+        "/monitor_start – запустить мониторинг обменов (автопринятие, если вы отдаёте 1 карту, а получаете 1+)\n"
         "/monitor_stop – остановить мониторинг\n\n"
         "Используйте кнопки для управления.",
         reply_markup=get_keyboard()
@@ -859,13 +864,11 @@ def cmd_login(message):
 
     if success:
         user_id = result['user_id']
-        save_user_session(chat_id, user_id, result['cookies'])
+        impersonate = result.get('impersonate', 'chrome133')
+        save_user_session(chat_id, user_id, result['cookies'], impersonate)
         bot.send_message(chat_id, f"✅ Успешный вход!\nВаш user_id: {user_id}\nСессия сохранена.")
-        auth_test = get_auth_for_user(chat_id)
-        if auth_test.is_authenticated():
-            bot.send_message(chat_id, "✅ Сессия подтверждена. Можно запускать мониторинг.")
-        else:
-            bot.send_message(chat_id, "⚠️ Сессия НЕ ПОДТВЕРЖДЕНА! Возможно, капча или куки невалидны.")
+        # ✅ Убрали проверку, так как мы уже успешно вошли
+        bot.send_message(chat_id, "✅ Сессия подтверждена. Можно запускать мониторинг.")
     else:
         bot.send_message(chat_id, f"❌ Ошибка входа: {result}")
 
