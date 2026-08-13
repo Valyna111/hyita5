@@ -57,11 +57,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КЛАСС АВТОРИЗАЦИИ (с улучшенным логином и ретраями) ====================
+# ==================== КЛАСС АВТОРИЗАЦИИ (исправлен) ====================
 class MangaBuffAuth:
     BASE_URL = "https://mangabuff.ru"
 
-    def __init__(self, proxy: dict = None, impersonate: str = "chrome131"):
+    def __init__(self, proxy: dict = None, impersonate: str = "chrome133"):
         self.impersonate = impersonate
         self.proxy = proxy
         self._setup_session(proxy)
@@ -74,13 +74,22 @@ class MangaBuffAuth:
         if proxy:
             self.session.proxies.update(proxy)
 
+        # Максимально приближенные к реальному браузеру заголовки
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.109 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Sec-Ch-Ua': '"Google Chrome";v="131", "Not_A Brand";v="8"',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
             'Sec-Ch-Ua-Mobile': '?0',
             'Sec-Ch-Ua-Platform': '"Windows"',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',  # для первого запроса, потом сменится
+            'Sec-Fetch-User': '?1',
         })
 
     def _get_csrf_from_cookies(self) -> str:
@@ -100,6 +109,9 @@ class MangaBuffAuth:
             logger.warning("⏸️ Бот на паузе из-за капчи, запрос пропущен")
             return None
 
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 30
+
         response = self.session.request(method, url, **kwargs)
         final_url = response.url if hasattr(response, 'url') else None
         if final_url and "page-captcha" in final_url:
@@ -118,8 +130,8 @@ class MangaBuffAuth:
         return self._request('POST', url, data=data, json=json, **kwargs)
 
     def login(self, email: str, password: str):
-        """Повторяем попытки с разными impersonate при 403"""
-        impersonate_versions = ["chrome131", "chrome133", "chrome134", "edge131", "safari17_0"]
+        """Повторяем попытки с разными impersonate и полными заголовками"""
+        impersonate_versions = ["chrome133", "chrome134", "chrome131", "edge131", "safari17_0"]
         last_error = None
 
         for imp in impersonate_versions:
@@ -131,29 +143,45 @@ class MangaBuffAuth:
                     self.session = requests.Session()
                 if self.proxy:
                     self.session.proxies.update(self.proxy)
+
                 self.session.headers.update({
-                    'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{imp.replace("chrome", "")}.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': '"Windows"',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
                 })
 
-                resp = self.session.get(f'{self.BASE_URL}/login')
+                # 1. GET /login – получаем CSRF и куки
+                resp = self.session.get(f'{self.BASE_URL}/login', timeout=30)
                 if resp.status_code == 403:
                     logger.warning(f"⚠️ 403 Forbidden с impersonate={imp}, пробуем следующий")
                     time.sleep(3)
                     continue
-
                 if resp.status_code != 200:
                     last_error = f'GET login failed: HTTP {resp.status_code}'
                     continue
+
+                # Обновляем заголовок Sec-Fetch-Site для POST (теперь same-origin)
+                self.session.headers.update({'Sec-Fetch-Site': 'same-origin'})
 
                 csrf = self._get_csrf_from_cookies()
                 if not csrf:
                     last_error = 'CSRF token not found'
                     continue
 
-                time.sleep(1)
+                time.sleep(1.5)
 
+                # 2. POST /login
                 login_data = {'email': email, 'password': password, 'remember': 'on'}
                 headers = {
                     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -161,10 +189,21 @@ class MangaBuffAuth:
                     'X-Requested-With': 'XMLHttpRequest',
                     'Referer': f'{self.BASE_URL}/login',
                     'Origin': self.BASE_URL,
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-origin',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
                 }
-                resp = self.session.post(f'{self.BASE_URL}/login', data=login_data, headers=headers, allow_redirects=False)
+                # allow_redirects по умолчанию True
+                resp = self.session.post(
+                    f'{self.BASE_URL}/login',
+                    data=login_data,
+                    headers=headers,
+                    timeout=30
+                )
 
-                check = self.session.get(f'{self.BASE_URL}/')
+                # 3. Проверяем авторизацию через GET /
+                check = self.session.get(f'{self.BASE_URL}/', timeout=30)
                 if check.status_code != 200:
                     last_error = 'Auth check failed'
                     continue
@@ -189,7 +228,7 @@ class MangaBuffAuth:
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"❌ Ошибка при попытке {imp}: {e}")
-                time.sleep(3)
+                time.sleep(5)
 
         return False, last_error or "Не удалось войти после всех попыток"
 
@@ -361,9 +400,8 @@ if not BOT_TOKEN:
     print("❌ Не найден TRADE_BOT_TOKEN или BOT_TOKEN в .env файле")
     sys.exit(1)
 
-# Интервалы опроса – редкий и адаптивный
-CHECK_INTERVAL = 60   # базовый интервал – 60 сек
-MAX_CHECK_INTERVAL = 300  # максимум 5 минут
+CHECK_INTERVAL = 60
+MAX_CHECK_INTERVAL = 300
 
 SESSIONS_FILE = Path(__file__).parent / "tg_sessions.json"
 PROCESSED_TRADES_FILE = Path(__file__).parent / "processed_trades.json"
@@ -484,30 +522,25 @@ def handle_captcha_resolved(call):
     global captcha_paused, captcha_notified, ws_auth, ws_chat_id
     chat_id = call.message.chat.id
 
-    # 1. Пересоздаём авторизацию (подхватываем свежие куки)
     auth = get_auth_for_user(chat_id)
     if not auth:
         bot.answer_callback_query(call.id, "❌ Нет сессии. Войдите заново.")
         return
 
-    # 2. Проверяем, что капча действительно ушла
     resp = auth.get(f"{auth.BASE_URL}/")
     if resp is None or "page-captcha" in str(resp.url):
         bot.answer_callback_query(call.id, "❌ Капча всё ещё активна. Пройдите её вручную и нажмите снова.")
         return
 
-    # 3. Обновляем глобальные переменные для WS
     ws_auth = auth
     ws_chat_id = chat_id
 
-    # 4. Перезапускаем WebSocket с новой сессией
     if ws_running:
         logger.info("🔄 Перезапускаем WebSocket с обновлённой сессией")
         stop_websocket()
         time.sleep(2)
         start_websocket(chat_id, auth)
 
-    # 5. Снимаем паузу
     captcha_paused = False
     captcha_notified = False
     save_captcha_pause()
@@ -569,7 +602,7 @@ def process_trade(trade_id, auth, chat_id):
         logger.error(f"❌ Критическая ошибка в process_trade: {e}", exc_info=True)
         return False
 
-# ---------- РЕЗЕРВНЫЙ ОПРОС (редкий, адаптивный) ----------
+# ---------- РЕЗЕРВНЫЙ ОПРОС ----------
 def check_and_process_new_trades(auth, chat_id):
     global current_check_interval, last_trade_time
 
@@ -743,7 +776,7 @@ def on_ws_close(ws, close_status_code, close_msg):
     ws_connected = False
     logger.warning(f"⚠️ WebSocket закрыт: {close_status_code} - {close_msg}")
 
-# ---------- МОНИТОРИНГ (с редким HTTP-опросом) ----------
+# ---------- МОНИТОРИНГ ----------
 def monitoring_loop(chat_id):
     global monitoring_active, current_check_interval, last_trade_time, ws_auth, ws_chat_id
 
@@ -765,13 +798,11 @@ def monitoring_loop(chat_id):
             time.sleep(30)
             continue
 
-        # Адаптивный интервал: если давно не было обменов, увеличиваем
         if last_trade_time and (time.time() - last_trade_time) > 300:
             current_check_interval = min(current_check_interval * 1.2, MAX_CHECK_INTERVAL)
         else:
             current_check_interval = CHECK_INTERVAL
 
-        # Резервный опрос
         try:
             new_count = check_and_process_new_trades(auth, chat_id)
             if new_count > 0:
@@ -830,7 +861,6 @@ def cmd_login(message):
         user_id = result['user_id']
         save_user_session(chat_id, user_id, result['cookies'])
         bot.send_message(chat_id, f"✅ Успешный вход!\nВаш user_id: {user_id}\nСессия сохранена.")
-        # Проверяем сессию
         auth_test = get_auth_for_user(chat_id)
         if auth_test.is_authenticated():
             bot.send_message(chat_id, "✅ Сессия подтверждена. Можно запускать мониторинг.")
