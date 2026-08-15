@@ -23,16 +23,17 @@ except ImportError:
     print("❌ Установите beautifulsoup4: pip install beautifulsoup4")
     sys.exit(1)
 
-# ========== ПРИНУДИТЕЛЬНО ОТКЛЮЧАЕМ curl_cffi ==========
-# Используем только requests, чтобы избежать ошибок impersonate
-USE_CURL_CFFI = False
+# ========== curl_cffi (з перевіркою підтримки) ==========
+USE_CURL_CFFI = True
 try:
     from curl_cffi.requests import Session as CffiSession
-    # Если нужно, можно оставить импорт, но флаг уже False
 except ImportError:
-    pass
+    USE_CURL_CFFI = False
+    print("[WARN] curl_cffi не установлен, используем requests. Возможны проблемы с Cloudflare.")
+    import requests
 
-import requests  # всегда используем requests
+# Тільки ці версії підтримуються і працюють
+SUPPORTED_IMPERSONATE = ["chrome131", "chrome133", "chrome134"]
 
 try:
     import telebot
@@ -66,13 +67,19 @@ class MangaBuffAuth:
     BASE_URL = "https://mangabuff.ru"
 
     def __init__(self, proxy: dict = None, impersonate: str = "chrome133"):
-        self.impersonate = impersonate  # сохраняем, но не используем (только для совместимости)
+        # Перевіряємо, чи підтримується передана версія
+        if impersonate not in SUPPORTED_IMPERSONATE:
+            logger.warning(f"Impersonate '{impersonate}' не підтримується, використовуємо chrome133")
+            impersonate = "chrome133"
+        self.impersonate = impersonate
         self.proxy = proxy
         self._setup_session(proxy)
 
     def _setup_session(self, proxy):
-        # Всегда используем requests.Session
-        self.session = requests.Session()
+        if USE_CURL_CFFI:
+            self.session = CffiSession(impersonate=self.impersonate)
+        else:
+            self.session = requests.Session()
         if proxy:
             self.session.proxies.update(proxy)
 
@@ -104,6 +111,16 @@ class MangaBuffAuth:
                 return unquote(value)
         return ''
 
+    def _get_csrf_from_html(self, html: str) -> str:
+        soup = BeautifulSoup(html, 'html.parser')
+        meta = soup.find('meta', {'name': 'csrf-token'})
+        if meta and meta.get('content'):
+            return meta['content']
+        token_input = soup.find('input', {'name': '_token'})
+        if token_input and token_input.get('value'):
+            return token_input['value']
+        return ''
+
     def _request(self, method, url, **kwargs):
         global captcha_paused, captcha_notified
         if captcha_paused:
@@ -113,7 +130,12 @@ class MangaBuffAuth:
         if 'timeout' not in kwargs:
             kwargs['timeout'] = 30
 
-        response = self.session.request(method, url, **kwargs)
+        try:
+            response = self.session.request(method, url, **kwargs)
+        except Exception as e:
+            logger.error(f"Ошибка запроса: {e}")
+            return None
+
         final_url = response.url if hasattr(response, 'url') else None
         if final_url and "page-captcha" in final_url:
             logger.warning("⚠️ Обнаружена капча! Ставим бота на паузу.")
@@ -130,68 +152,115 @@ class MangaBuffAuth:
     def post(self, url, data=None, json=None, **kwargs):
         return self._request('POST', url, data=data, json=json, **kwargs)
 
-    # =========== НОВЫЙ МЕТОД LOGIN (упрощённый, без impersonate) ===========
     def login(self, email: str, password: str):
-        # 1. Загружаем страницу логина, чтобы получить свежие куки и CSRF
-        resp = self.session.get(f'{self.BASE_URL}/login')
-        if resp.status_code != 200:
-            return False, f'GET login failed: HTTP {resp.status_code}'
+        last_error = None
 
-        csrf = self._get_csrf_from_cookies()
-        if not csrf:
-            return False, 'CSRF token not found'
+        for imp in SUPPORTED_IMPERSONATE:
+            try:
+                logger.info(f"🔄 Пробуем вход с impersonate={imp}")
+                if USE_CURL_CFFI:
+                    self.session = CffiSession(impersonate=imp)
+                else:
+                    self.session = requests.Session()
+                if self.proxy:
+                    self.session.proxies.update(self.proxy)
 
-        time.sleep(1)  # небольшая пауза
+                self.session.headers.update({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': '"Windows"',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                })
 
-        # 2. Формируем данные и заголовки (как в реальном запросе)
-        login_data = {'email': email, 'password': password, 'remember': 'on'}
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'X-XSRF-TOKEN': csrf,
-            'X-CSRF-TOKEN': csrf,           # добавим для полной совместимости
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': f'{self.BASE_URL}/login',
-            'Origin': self.BASE_URL,
-        }
+                resp = self.session.get(f'{self.BASE_URL}/login', timeout=30)
+                if resp.status_code == 403:
+                    logger.warning(f"⚠️ 403 Forbidden з {imp}, пробуємо наступний")
+                    time.sleep(3)
+                    continue
+                if resp.status_code != 200:
+                    last_error = f'GET login failed: HTTP {resp.status_code}'
+                    continue
 
-        # 3. Отправляем POST, запрещая автоматический редирект (как в браузере)
-        resp = self.session.post(
-            f'{self.BASE_URL}/login',
-            data=login_data,
-            headers=headers,
-            allow_redirects=False
-        )
+                csrf = self._get_csrf_from_cookies()
+                if not csrf:
+                    csrf = self._get_csrf_from_html(resp.text)
+                if not csrf:
+                    last_error = 'CSRF token not found'
+                    continue
 
-        # 4. Проверяем, что сессия установлена – загружаем главную страницу
-        check = self.session.get(f'{self.BASE_URL}/')
-        if check.status_code != 200:
-            return False, 'Auth check failed'
+                login_data = {'email': email, 'password': password, 'remember': 'on'}
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-XSRF-TOKEN': csrf,
+                    'X-CSRF-TOKEN': csrf,
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Referer': f'{self.BASE_URL}/login',
+                    'Origin': self.BASE_URL,
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-origin',
+                }
 
-        html_text = check.text
+                resp = self.session.post(
+                    f'{self.BASE_URL}/login',
+                    data=login_data,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=30
+                )
 
-        # 5. Ищем ID пользователя
-        match = re.search(r'data-userid="(\d+)"', html_text)
-        if not match:
-            match = re.search(r'/users/(\d+)', html_text)
+                check = self.session.get(f'{self.BASE_URL}/', timeout=30)
+                if check.status_code != 200:
+                    last_error = 'Auth check failed'
+                    continue
 
-        if match:
-            user_id = match.group(1)
-            cookies = []
-            for name, value in self.session.cookies.items():
-                cookies.append({'name': name, 'value': value, 'domain': 'mangabuff.ru'})
-            # Возвращаем impersonate для совместимости (используем chrome133 по умолчанию)
-            return True, {
-                'user_id': user_id,
-                'cookies': cookies,
-                'impersonate': self.impersonate
-            }
-        else:
-            return False, 'User ID not found after login'
+                if "page-captcha" in str(check.url):
+                    last_error = 'Сайт показывает капчу. Пройдите её вручную и попробуйте снова.'
+                    continue
+
+                html_text = check.text
+                match = re.search(r'data-userid="(\d+)"', html_text)
+                if not match:
+                    match = re.search(r'/users/(\d+)', html_text)
+
+                if match:
+                    user_id = match.group(1)
+                    cookies = []
+                    for name, value in self.session.cookies.items():
+                        cookies.append({'name': name, 'value': value, 'domain': 'mangabuff.ru'})
+                    logger.info(f"✅ Успешный вход з {imp}, user_id={user_id}")
+                    self.impersonate = imp
+                    return True, {
+                        'user_id': user_id,
+                        'cookies': cookies,
+                        'impersonate': imp
+                    }
+                else:
+                    last_error = 'User ID not found after login'
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"❌ Ошибка при попытке {imp}: {e}")
+                time.sleep(5)
+
+        return False, last_error or "Не удалось войти после всех попыток"
 
     def load_cookies(self, cookies_list: list, impersonate: str = None):
+        if impersonate and impersonate not in SUPPORTED_IMPERSONATE:
+            logger.warning(f"Impersonate '{impersonate}' не підтримується, використовуємо chrome133")
+            impersonate = "chrome133"
         if impersonate:
             self.impersonate = impersonate
-            # Пересоздаём сессию (она всё равно requests)
             self._setup_session(self.proxy)
         for c in cookies_list:
             name = c.get('name')
