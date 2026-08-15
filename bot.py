@@ -23,13 +23,16 @@ except ImportError:
     print("❌ Установите beautifulsoup4: pip install beautifulsoup4")
     sys.exit(1)
 
+# ========== ПРИНУДИТЕЛЬНО ОТКЛЮЧАЕМ curl_cffi ==========
+# Используем только requests, чтобы избежать ошибок impersonate
+USE_CURL_CFFI = False
 try:
     from curl_cffi.requests import Session as CffiSession
-    USE_CURL_CFFI = True
+    # Если нужно, можно оставить импорт, но флаг уже False
 except ImportError:
-    import requests
-    USE_CURL_CFFI = False
-    print("[WARN] curl_cffi не установлен, используется requests. Возможны проблемы с Cloudflare.")
+    pass
+
+import requests  # всегда используем requests
 
 try:
     import telebot
@@ -63,15 +66,13 @@ class MangaBuffAuth:
     BASE_URL = "https://mangabuff.ru"
 
     def __init__(self, proxy: dict = None, impersonate: str = "chrome133"):
-        self.impersonate = impersonate
+        self.impersonate = impersonate  # сохраняем, но не используем (только для совместимости)
         self.proxy = proxy
         self._setup_session(proxy)
 
     def _setup_session(self, proxy):
-        if USE_CURL_CFFI:
-            self.session = CffiSession(impersonate=self.impersonate)
-        else:
-            self.session = requests.Session()
+        # Всегда используем requests.Session
+        self.session = requests.Session()
         if proxy:
             self.session.proxies.update(proxy)
 
@@ -129,7 +130,7 @@ class MangaBuffAuth:
     def post(self, url, data=None, json=None, **kwargs):
         return self._request('POST', url, data=data, json=json, **kwargs)
 
-    # =========== НОВЫЙ МЕТОД LOGIN (упрощённый, без перебора impersonate) ===========
+    # =========== НОВЫЙ МЕТОД LOGIN (упрощённый, без impersonate) ===========
     def login(self, email: str, password: str):
         # 1. Загружаем страницу логина, чтобы получить свежие куки и CSRF
         resp = self.session.get(f'{self.BASE_URL}/login')
@@ -178,7 +179,7 @@ class MangaBuffAuth:
             cookies = []
             for name, value in self.session.cookies.items():
                 cookies.append({'name': name, 'value': value, 'domain': 'mangabuff.ru'})
-            # Возвращаем impersonate для сохранения в сессии
+            # Возвращаем impersonate для совместимости (используем chrome133 по умолчанию)
             return True, {
                 'user_id': user_id,
                 'cookies': cookies,
@@ -190,6 +191,7 @@ class MangaBuffAuth:
     def load_cookies(self, cookies_list: list, impersonate: str = None):
         if impersonate:
             self.impersonate = impersonate
+            # Пересоздаём сессию (она всё равно requests)
             self._setup_session(self.proxy)
         for c in cookies_list:
             name = c.get('name')
